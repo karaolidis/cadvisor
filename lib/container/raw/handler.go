@@ -19,6 +19,10 @@ package raw
 
 import (
 	"fmt"
+	"os"
+	"path"
+	"slices"
+	"strconv"
 
 	"github.com/google/cadvisor/lib/container"
 	"github.com/google/cadvisor/lib/container/common"
@@ -45,13 +49,19 @@ type rawContainerHandler struct {
 	includedMetrics container.MetricSet
 
 	libcontainerHandler *libcontainer.Handler
+
+	rootFs       string
+	networkStats bool
+	// Process whose network namespace is reported, and its /proc/<pid>/net/dev.
+	netPid int
+	netDev os.FileInfo
 }
 
 func isRootCgroup(name string) bool {
 	return name == "/"
 }
 
-func newRawContainerHandler(name string, cgroupSubsystems map[string]string, machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, watcher *common.InotifyWatcher, rootFs string, includedMetrics container.MetricSet) (container.ContainerHandler, error) {
+func newRawContainerHandler(name string, cgroupSubsystems map[string]string, machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, watcher *common.InotifyWatcher, rootFs string, includedMetrics container.MetricSet, networkStats bool) (container.ContainerHandler, error) {
 	cHints, err := common.GetContainerHintsFromFile(*common.ArgContainerHints)
 	if err != nil {
 		return nil, err
@@ -90,6 +100,8 @@ func newRawContainerHandler(name string, cgroupSubsystems map[string]string, mac
 		externalMounts:      externalMounts,
 		includedMetrics:     includedMetrics,
 		libcontainerHandler: handler,
+		rootFs:              rootFs,
+		networkStats:        networkStats,
 	}, nil
 }
 
@@ -119,7 +131,7 @@ func (h *rawContainerHandler) Start() {}
 func (h *rawContainerHandler) Cleanup() {}
 
 func (h *rawContainerHandler) GetSpec() (info.ContainerSpec, error) {
-	const hasNetwork = false
+	hasNetwork := h.hasNetworkStats()
 	hasFilesystem := isRootCgroup(h.name) || len(h.externalMounts) > 0
 	spec, err := common.GetSpec(h.cgroupPaths, h.machineInfoFactory, hasNetwork, hasFilesystem)
 	if err != nil {
@@ -237,12 +249,82 @@ func (h *rawContainerHandler) GetStats() (*info.ContainerStats, error) {
 		return stats, err
 	}
 
+	if h.hasNetworkStats() {
+		pids, err := h.libcontainerHandler.GetProcesses()
+		if err == nil {
+			stats.Network, err = h.getNetworkStats(pids)
+		}
+		if err != nil {
+			klog.V(4).Infof("Unable to get network stats for %q: %v", h.name, err)
+		}
+	}
+
 	// Get filesystem stats.
 	err = h.getFsStats(stats)
 	if err != nil {
 		return stats, err
 	}
 
+	return stats, nil
+}
+
+func (h *rawContainerHandler) hasNetworkStats() bool {
+	return h.networkStats && !isRootCgroup(h.name) && h.includedMetrics.HasAny(container.AllNetworkMetrics)
+}
+
+// netDevPath returns /proc/<pid>/net/dev, which has the same inode for all
+// processes in a network namespace and, unlike /proc/<pid>/ns/net, can be
+// stat'ed without ptrace access.
+func netDevPath(rootFs string, pid int) string {
+	return path.Join(rootFs, "proc", strconv.Itoa(pid), "net", "dev")
+}
+
+// findNetnsPid returns the lowest of pids that is not in the host network
+// namespace, along with its /proc/<pid>/net/dev, or 0 if there is none.
+func findNetnsPid(rootFs string, pids []int, hostNetDev os.FileInfo) (int, os.FileInfo) {
+	for _, pid := range slices.Sorted(slices.Values(pids)) {
+		if pid <= 0 {
+			continue
+		}
+		fi, err := os.Stat(netDevPath(rootFs, pid))
+		if err != nil || os.SameFile(fi, hostNetDev) {
+			continue
+		}
+		return pid, fi
+	}
+	return 0, nil
+}
+
+// isNetPidValid reports whether the cached pid is still in the same network
+// namespace.
+func (h *rawContainerHandler) isNetPidValid() bool {
+	fi, err := os.Stat(netDevPath(h.rootFs, h.netPid))
+	return err == nil && os.SameFile(fi, h.netDev)
+}
+
+// getNetworkStats returns the stats of the network namespace of one of pids, the
+// processes of the cgroup, or nil if they are all in the host network namespace.
+func (h *rawContainerHandler) getNetworkStats(pids []int) (*info.NetworkStats, error) {
+	if !slices.Contains(pids, h.netPid) || !h.isNetPidValid() {
+		h.netPid, h.netDev = 0, nil
+		hostNetDev, err := os.Stat(netDevPath(h.rootFs, 1))
+		if err != nil {
+			return nil, err
+		}
+		h.netPid, h.netDev = findNetnsPid(h.rootFs, pids, hostNetDev)
+		if h.netPid == 0 {
+			return nil, nil
+		}
+	}
+
+	stats, err := libcontainer.NetworkStatsFromProc(h.rootFs, h.netPid, h.includedMetrics)
+	if err == nil && !h.isNetPidValid() {
+		err = fmt.Errorf("network namespace of pid %d changed while reading its stats", h.netPid)
+	}
+	if err != nil {
+		h.netPid, h.netDev = 0, nil
+		return nil, err
+	}
 	return stats, nil
 }
 

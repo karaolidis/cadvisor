@@ -18,7 +18,10 @@
 package raw
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -603,4 +606,123 @@ func (m machineInfo) GetMachineInfo() (*info.MachineInfo, error) {
 
 func (m machineInfo) GetVersionInfo() (*info.VersionInfo, error) {
 	panic("unsupported")
+}
+
+const testProcNetDev = `Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:       1       1    0    0    0     0          0         0        1       1    0    0    0     0       0          0
+  eth0:     100       2    0    0    0     0          0         0      200       3    0    0    0     0       0          0
+`
+
+// makeNetDev creates rootFs/proc/<pid>/net/dev, as a hard link to the one of
+// sameNetns if it is not 0.
+func makeNetDev(t *testing.T, rootFs string, pid, sameNetns int) {
+	t.Helper()
+	assert.NoError(t, os.MkdirAll(filepath.Join(rootFs, "proc", strconv.Itoa(pid), "net"), 0o755))
+	if sameNetns != 0 {
+		assert.NoError(t, os.Link(netDevPath(rootFs, sameNetns), netDevPath(rootFs, pid)))
+		return
+	}
+	assert.NoError(t, os.WriteFile(netDevPath(rootFs, pid), []byte(testProcNetDev), 0o644))
+}
+
+func TestFindNetnsPid(t *testing.T) {
+	rootFs := t.TempDir()
+	makeNetDev(t, rootFs, 1, 0)
+	makeNetDev(t, rootFs, 5, 1)
+	makeNetDev(t, rootFs, 20, 0)
+	makeNetDev(t, rootFs, 30, 20)
+	hostNetDev, err := os.Stat(netDevPath(rootFs, 1))
+	assert.NoError(t, err)
+
+	cases := map[string]struct {
+		pids        []int
+		expectedPid int
+	}{
+		"no pids":             {pids: nil, expectedPid: 0},
+		"only host pids":      {pids: []int{1, 5}, expectedPid: 0},
+		"hidden pids":         {pids: []int{0, -1}, expectedPid: 0},
+		"vanished pid":        {pids: []int{25, 30}, expectedPid: 30},
+		"host pid first":      {pids: []int{5, 30}, expectedPid: 30},
+		"lowest non-host pid": {pids: []int{30, 5, 20}, expectedPid: 20},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			pid, fi := findNetnsPid(rootFs, tc.pids, hostNetDev)
+			assert.Equal(t, tc.expectedPid, pid)
+			assert.Equal(t, tc.expectedPid != 0, fi != nil)
+		})
+	}
+}
+
+func TestGetNetworkStats(t *testing.T) {
+	rootFs := t.TempDir()
+	makeNetDev(t, rootFs, 1, 0)
+	makeNetDev(t, rootFs, 5, 1)
+	makeNetDev(t, rootFs, 20, 0)
+	makeNetDev(t, rootFs, 30, 0)
+
+	h := &rawContainerHandler{
+		name:            "/system.slice/test.service/libpod-payload-0",
+		rootFs:          rootFs,
+		networkStats:    true,
+		includedMetrics: container.MetricSet{container.NetworkUsageMetrics: struct{}{}},
+	}
+	assert.True(t, h.hasNetworkStats())
+
+	stats, err := h.getNetworkStats([]int{5})
+	assert.NoError(t, err)
+	assert.Nil(t, stats)
+
+	stats, err = h.getNetworkStats([]int{5, 30})
+	assert.NoError(t, err)
+	assert.Equal(t, 30, h.netPid)
+	assert.Equal(t, []info.InterfaceStats{{Name: "eth0", RxBytes: 100, RxPackets: 2, TxBytes: 200, TxPackets: 3}}, stats.Interfaces)
+
+	// The chosen pid is kept while it stays in the cgroup and netns.
+	_, err = h.getNetworkStats([]int{20, 30})
+	assert.NoError(t, err)
+	assert.Equal(t, 30, h.netPid)
+
+	// A pid that left the cgroup is replaced.
+	_, err = h.getNetworkStats([]int{20})
+	assert.NoError(t, err)
+	assert.Equal(t, 20, h.netPid)
+
+	// A pid that was reused in another netns is replaced.
+	assert.NoError(t, os.Remove(netDevPath(rootFs, 20)))
+	assert.NoError(t, os.Link(netDevPath(rootFs, 1), netDevPath(rootFs, 20)))
+	stats, err = h.getNetworkStats([]int{20, 30})
+	assert.NoError(t, err)
+	assert.Equal(t, 30, h.netPid)
+	assert.NotNil(t, stats)
+
+	// No stats once only host netns pids are left.
+	assert.NoError(t, os.RemoveAll(filepath.Join(rootFs, "proc", "30")))
+	stats, err = h.getNetworkStats([]int{20, 30})
+	assert.NoError(t, err)
+	assert.Equal(t, 0, h.netPid)
+	assert.Nil(t, stats)
+
+	h.networkStats = false
+	assert.False(t, h.hasNetworkStats())
+	h.networkStats = true
+	h.includedMetrics = container.MetricSet{}
+	assert.False(t, h.hasNetworkStats())
+	h.includedMetrics = container.MetricSet{container.NetworkUsageMetrics: struct{}{}}
+	h.name = "/"
+	assert.False(t, h.hasNetworkStats())
+}
+
+func TestInHostPidNamespace(t *testing.T) {
+	rootFs := t.TempDir()
+	assert.False(t, inHostPidNamespace(rootFs))
+
+	assert.NoError(t, os.MkdirAll(filepath.Join(rootFs, "proc"), 0o755))
+	assert.NoError(t, os.Symlink("1", filepath.Join(rootFs, "proc", "self")))
+	assert.False(t, inHostPidNamespace(rootFs))
+
+	assert.NoError(t, os.Remove(filepath.Join(rootFs, "proc", "self")))
+	assert.NoError(t, os.Symlink(strconv.Itoa(os.Getpid()), filepath.Join(rootFs, "proc", "self")))
+	assert.True(t, inHostPidNamespace(rootFs))
 }

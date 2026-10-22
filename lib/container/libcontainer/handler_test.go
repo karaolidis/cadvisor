@@ -25,6 +25,7 @@ import (
 	"github.com/opencontainers/cgroups"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/google/cadvisor/lib/container"
 	info "github.com/google/cadvisor/lib/model"
 )
 
@@ -442,4 +443,29 @@ func TestSetMemoryEventsFileNotFound(t *testing.T) {
 
 	assert.Equal(t, uint64(0), ret.Memory.Events.High)
 	assert.Equal(t, uint64(0), ret.Memory.Events.Max)
+}
+
+func TestNetworkStatsFromProc(t *testing.T) {
+	rootFs := t.TempDir()
+	netDir := filepath.Join(rootFs, "proc", "10", "net")
+	assert.NoError(t, os.MkdirAll(netDir, 0o755))
+	procNetDev, err := os.ReadFile("testdata/procnetdev")
+	assert.NoError(t, err)
+	assert.NoError(t, os.WriteFile(filepath.Join(netDir, "dev"), procNetDev, 0o644))
+
+	metrics := container.MetricSet{container.NetworkUsageMetrics: struct{}{}}
+
+	stats, err := NetworkStatsFromProc(rootFs, 10, metrics)
+	assert.NoError(t, err)
+	assert.Len(t, stats.Interfaces, 2)
+	assert.Equal(t, "wlp4s0", stats.Interfaces[0].Name)
+	assert.Equal(t, stats.Interfaces[0], stats.InterfaceStats)
+
+	stats, err = NetworkStatsFromProc(rootFs, 20, metrics)
+	assert.Error(t, err)
+	assert.Equal(t, &info.NetworkStats{}, stats)
+
+	stats, err = NetworkStatsFromProc(rootFs, 20, container.MetricSet{})
+	assert.NoError(t, err)
+	assert.Equal(t, &info.NetworkStats{}, stats)
 }

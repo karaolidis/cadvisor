@@ -19,7 +19,11 @@ package raw
 import (
 	"flag"
 	"fmt"
+	"os"
+	"path"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/google/cadvisor/lib/container"
 	"github.com/google/cadvisor/lib/container/common"
@@ -34,6 +38,7 @@ import (
 var (
 	DockerOnly             = flag.Bool("docker_only", false, "Only report docker containers in addition to root stats")
 	disableRootCgroupStats = flag.Bool("disable_root_cgroup_stats", false, "Disable collecting root Cgroup stats")
+	rawCgroupNetworkStats  = flag.Bool("raw_cgroup_network_stats", false, "Collect network stats for non-root raw cgroups whose processes are not in the host network namespace. Requires cAdvisor to share the host pid namespace. Cgroups in the host network namespace get no network stats")
 )
 
 type rawFactory struct {
@@ -54,6 +59,9 @@ type rawFactory struct {
 
 	// List of raw container cgroup path prefix whitelist.
 	rawPrefixWhiteList []string
+
+	networkStatsOnce sync.Once
+	networkStats     bool
 }
 
 func (f *rawFactory) String() string {
@@ -65,7 +73,10 @@ func (f *rawFactory) NewContainerHandler(name string, metadataEnvAllowList []str
 	if !inHostNamespace {
 		rootFs = "/rootfs"
 	}
-	return newRawContainerHandler(name, f.cgroupSubsystems, f.machineInfoFactory, f.fsInfo, f.watcher, rootFs, f.includedMetrics)
+	f.networkStatsOnce.Do(func() {
+		f.networkStats = *rawCgroupNetworkStats && inHostPidNamespace(rootFs)
+	})
+	return newRawContainerHandler(name, f.cgroupSubsystems, f.machineInfoFactory, f.fsInfo, f.watcher, rootFs, f.includedMetrics, f.networkStats)
 }
 
 // The raw factory can handle any container. If --docker_only is set to true, non-docker containers are ignored except for "/" and those whitelisted by raw_cgroup_prefix_whitelist flag.
@@ -113,4 +124,21 @@ func Register(machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, incl
 	}
 	container.RegisterContainerHandlerFactory(factory, []watch.ContainerWatchSource{watch.Raw})
 	return nil
+}
+
+// inHostPidNamespace reports whether cAdvisor shares the pid namespace of the
+// procfs under rootFs, so that pids read from cgroup.procs refer to the same
+// processes in it.
+func inHostPidNamespace(rootFs string) bool {
+	self, err := os.Readlink(path.Join(rootFs, "proc", "self"))
+	if err != nil {
+		klog.Warningf("Disabling raw cgroup network stats: %v", err)
+		return false
+	}
+	if self != strconv.Itoa(os.Getpid()) {
+		klog.Warningf("Disabling raw cgroup network stats: cAdvisor is not in the host pid namespace")
+		return false
+	}
+	klog.V(1).Infof("Collecting network stats for raw cgroups")
+	return true
 }

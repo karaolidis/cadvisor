@@ -119,53 +119,10 @@ func (h *Handler) GetStats() (*info.ContainerStats, error) {
 
 	// If we know the pid then get network stats from /proc/<pid>/net/dev
 	if h.pid > 0 {
-		stats.Network = &info.NetworkStats{}
-		if h.includedMetrics.Has(container.NetworkUsageMetrics) {
-			netStats, err := networkStatsFromProc(h.rootFs, h.pid)
-			if err != nil {
-				klog.V(4).Infof("Unable to get network stats from pid %d: %v", h.pid, err)
-			} else {
-				stats.Network.Interfaces = append(stats.Network.Interfaces, netStats...)
-			}
-		}
-		if h.includedMetrics.Has(container.NetworkTcpUsageMetrics) {
-			t, err := tcpStatsFromProc(h.rootFs, h.pid, "net/tcp")
-			if err != nil {
-				klog.V(4).Infof("Unable to get tcp stats from pid %d: %v", h.pid, err)
-			} else {
-				stats.Network.Tcp = t
-			}
-
-			t6, err := tcpStatsFromProc(h.rootFs, h.pid, "net/tcp6")
-			if err != nil {
-				klog.V(4).Infof("Unable to get tcp6 stats from pid %d: %v", h.pid, err)
-			} else {
-				stats.Network.Tcp6 = t6
-			}
-
-		}
-		if h.includedMetrics.Has(container.NetworkAdvancedTcpUsageMetrics) {
-			ta, err := advancedTCPStatsFromProc(h.rootFs, h.pid, "net/netstat", "net/snmp")
-			if err != nil {
-				klog.V(4).Infof("Unable to get advanced tcp stats from pid %d: %v", h.pid, err)
-			} else {
-				stats.Network.TcpAdvanced = ta
-			}
-		}
-		if h.includedMetrics.Has(container.NetworkUdpUsageMetrics) {
-			u, err := udpStatsFromProc(h.rootFs, h.pid, "net/udp")
-			if err != nil {
-				klog.V(4).Infof("Unable to get udp stats from pid %d: %v", h.pid, err)
-			} else {
-				stats.Network.Udp = u
-			}
-
-			u6, err := udpStatsFromProc(h.rootFs, h.pid, "net/udp6")
-			if err != nil {
-				klog.V(4).Infof("Unable to get udp6 stats from pid %d: %v", h.pid, err)
-			} else {
-				stats.Network.Udp6 = u6
-			}
+		var nerr error
+		stats.Network, nerr = NetworkStatsFromProc(h.rootFs, h.pid, h.includedMetrics)
+		if nerr != nil {
+			klog.V(4).Infof("Unable to get network stats from pid %d: %v", h.pid, nerr)
 		}
 	}
 	// some process metrics are per container ( number of processes, number of
@@ -187,11 +144,6 @@ func (h *Handler) GetStats() (*info.ContainerStats, error) {
 
 		// if include processes metrics, just set threads metrics if exist, and has no relationship with cpu path
 		setThreadsStats(cgroupStats, stats)
-	}
-
-	// For backwards compatibility.
-	if stats.Network != nil && len(stats.Network.Interfaces) > 0 {
-		stats.Network.InterfaceStats = stats.Network.Interfaces[0]
 	}
 
 	return stats, nil
@@ -378,7 +330,69 @@ func (h *Handler) schedulerStatsFromProcs() (info.CpuSchedstat, error) {
 	return schedstats, nil
 }
 
-func networkStatsFromProc(rootFs string, pid int) ([]info.InterfaceStats, error) {
+// NetworkStatsFromProc returns the network stats of the network namespace of
+// pid. The returned stats are never nil; the error is only set if reading the
+// interface stats failed.
+func NetworkStatsFromProc(rootFs string, pid int, includedMetrics container.MetricSet) (*info.NetworkStats, error) {
+	var ifaceErr error
+	stats := &info.NetworkStats{}
+	if includedMetrics.Has(container.NetworkUsageMetrics) {
+		netStats, err := interfaceStatsFromProc(rootFs, pid)
+		if err != nil {
+			ifaceErr = err
+		} else {
+			stats.Interfaces = append(stats.Interfaces, netStats...)
+		}
+	}
+	if includedMetrics.Has(container.NetworkTcpUsageMetrics) {
+		t, err := tcpStatsFromProc(rootFs, pid, "net/tcp")
+		if err != nil {
+			klog.V(4).Infof("Unable to get tcp stats from pid %d: %v", pid, err)
+		} else {
+			stats.Tcp = t
+		}
+
+		t6, err := tcpStatsFromProc(rootFs, pid, "net/tcp6")
+		if err != nil {
+			klog.V(4).Infof("Unable to get tcp6 stats from pid %d: %v", pid, err)
+		} else {
+			stats.Tcp6 = t6
+		}
+
+	}
+	if includedMetrics.Has(container.NetworkAdvancedTcpUsageMetrics) {
+		ta, err := advancedTCPStatsFromProc(rootFs, pid, "net/netstat", "net/snmp")
+		if err != nil {
+			klog.V(4).Infof("Unable to get advanced tcp stats from pid %d: %v", pid, err)
+		} else {
+			stats.TcpAdvanced = ta
+		}
+	}
+	if includedMetrics.Has(container.NetworkUdpUsageMetrics) {
+		u, err := udpStatsFromProc(rootFs, pid, "net/udp")
+		if err != nil {
+			klog.V(4).Infof("Unable to get udp stats from pid %d: %v", pid, err)
+		} else {
+			stats.Udp = u
+		}
+
+		u6, err := udpStatsFromProc(rootFs, pid, "net/udp6")
+		if err != nil {
+			klog.V(4).Infof("Unable to get udp6 stats from pid %d: %v", pid, err)
+		} else {
+			stats.Udp6 = u6
+		}
+	}
+
+	// For backwards compatibility.
+	if len(stats.Interfaces) > 0 {
+		stats.InterfaceStats = stats.Interfaces[0]
+	}
+
+	return stats, ifaceErr
+}
+
+func interfaceStatsFromProc(rootFs string, pid int) ([]info.InterfaceStats, error) {
 	netStatsFile := path.Join(rootFs, "proc", strconv.Itoa(pid), "/net/dev")
 
 	ifaceStats, err := scanInterfaceStats(netStatsFile)
